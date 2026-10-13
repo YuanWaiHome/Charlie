@@ -56,7 +56,15 @@ function buildTextMessages_(blocks) {
   return chunks.map(function (text) { return { type: 'text', text: text }; });
 }
 
-function replyToLine_(replyToken, messages) {
+/**
+ * 用 replyToken 回覆；若失敗（常見原因：處理超過約 30 秒導致 token 過期），
+ * 且有對話目標 ID，就改用 Push API 補送到「同一個對話」
+ * （群組→groupId、聊天室→roomId、1對1→userId），避免結果石沉大海或推錯地方。
+ * @param {string} replyToken
+ * @param {Object[]} messages
+ * @param {string=} pushTarget groupId / roomId / userId
+ */
+function replyToLine_(replyToken, messages, pushTarget) {
   const token = getLineAccessToken_();
   const url = 'https://api.line.me/v2/bot/message/reply';
   const payload = { replyToken: replyToken, messages: messages };
@@ -67,8 +75,34 @@ function replyToLine_(replyToken, messages) {
     payload: JSON.stringify(payload),
     muteHttpExceptions: true,
   });
+  const code = res.getResponseCode();
+  if (code < 300) return;
+
+  const body = res.getContentText();
+  Logger.log('LINE reply 失敗 (' + code + ')：' + body);
+
+  // reply token 過期／無效時改走 Push；其他錯誤（例如訊息格式）Push 多半也會失敗，仍試一次並留下紀錄
+  if (pushTarget && pushTarget !== 'unknown') {
+    Logger.log('改以 Push API 補送到同一個對話：' + pushTarget);
+    pushToLine_(pushTarget, messages);
+  }
+}
+
+/** Push API：主動推播到指定 user / group / room（不依賴 replyToken） */
+function pushToLine_(to, messages) {
+  if (!to) return;
+  const token = getLineAccessToken_();
+  const url = 'https://api.line.me/v2/bot/message/push';
+  const payload = { to: to, messages: messages };
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
   if (res.getResponseCode() >= 300) {
-    Logger.log('LINE reply 失敗 (' + res.getResponseCode() + ')：' + res.getContentText());
+    Logger.log('LINE push 失敗 (' + res.getResponseCode() + ')：' + res.getContentText());
   }
 }
 

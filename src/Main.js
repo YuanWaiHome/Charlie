@@ -41,6 +41,8 @@ function handleEvent_(event) {
   if (text === null || text.trim() === '') return; // 沒tag到機器人，或不是文字訊息，忽略
 
   const sourceId = (event.source && (event.source.groupId || event.source.roomId || event.source.userId)) || 'unknown';
+  // reply 逾時改走 Push 時，要推回「同一個對話」（群組用 groupId，不是個人 userId）
+  const pushTarget = sourceId;
   const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
   const wantsHistory = text.indexOf(CONFIG.HISTORY_KEYWORD) !== -1; // 提到「歷史」→ 查詢時要搜尋所有工作表
   const vocab = getKnownVocabulary_();
@@ -49,17 +51,20 @@ function handleEvent_(event) {
   try {
     parsed = parseMessageWithGemini_(text, vocab, today);
   } catch (err) {
-    Logger.log('Gemini 解析失敗: ' + err);
+    const reason = String(err && err.message ? err.message : err);
+    Logger.log('Gemini 解析失敗: ' + reason);
     // Gemini 暫時掛掉時，如果訊息看起來像純查詢，就直接用文字去搜尋，不要讓使用者白等
     const fallback = buildFallbackQuery_(text);
     if (fallback) {
-      handleQuery_(event, fallback, sourceId, wantsHistory);
+      fallback.fallbackNote = 'ℹ️ AI 暫時無法使用，改用文字直接搜尋：\n（原因：' + reason + '）';
+      handleQuery_(event, fallback, sourceId, wantsHistory, pushTarget);
       return;
     }
     replyToLine_(event.replyToken, [{
       type: 'text',
-      text: '糟糕，我剛剛分析訊息時出了點問題，可以再傳一次看看嗎？🙏',
-    }]);
+      text: '糟糕，分析訊息時出了問題，請稍後再試一次。\n' +
+        '失敗原因：' + reason,
+    }], pushTarget);
     return;
   }
 
@@ -69,19 +74,19 @@ function handleEvent_(event) {
     replyToLine_(event.replyToken, [{
       type: 'text',
       text: '不好意思，我沒有抓到商品資訊耶 🥲\n' +
-        '記錄可以這樣說：\n「豬梅花 一斤 205 竹圍漁港」\n「洗衣精 2公升 189 好市多」\n' +
+        '記錄可以這樣說：\n「豬梅花 一斤 205 竹圍漁港」\n「200元一斤豬梅花」\n「洗衣精 2公升 189 好市多」\n' +
         '查詢可以這樣說：\n「梅花肉」或「豬梅花多少錢」\n' +
         '想連舊 Sheet 的資料一起查，加上「' + CONFIG.HISTORY_KEYWORD + '」：\n「豬梅花 ' + CONFIG.HISTORY_KEYWORD + '」',
-    }]);
+    }], pushTarget);
     return;
   }
 
   if (intent === 'query') {
-    handleQuery_(event, parsed, sourceId, wantsHistory);
+    handleQuery_(event, parsed, sourceId, wantsHistory, pushTarget);
     return;
   }
 
-  handleRecord_(event, parsed, text, sourceId, today, vocab);
+  handleRecord_(event, parsed, text, sourceId, today, vocab, pushTarget);
 }
 
 /**
@@ -97,7 +102,6 @@ function buildFallbackQuery_(text) {
   if (!term) return null;
   return {
     intent: 'query',
-    fallbackNote: 'ℹ️ AI 暫時無法使用，改用文字直接搜尋：',
     items: [{ product_canonical: term, product_raw: term }],
   };
 }
@@ -107,7 +111,7 @@ function buildFallbackQuery_(text) {
  * - 一般查詢：只查「目前使用中」的工作表，最多顯示最近 CONFIG.QUERY_LOOKBACK_COUNT 筆
  * - 帶「歷史」：搜尋所有工作表（最多 CONFIG.HISTORY_MAX_SHEETS 張），每個項目最多顯示 CONFIG.HISTORY_MAX_RECORDS 筆
  */
-function handleQuery_(event, parsed, sourceId, wantsHistory) {
+function handleQuery_(event, parsed, sourceId, wantsHistory, pushTarget) {
   const limit = wantsHistory ? CONFIG.HISTORY_MAX_RECORDS : CONFIG.QUERY_LOOKBACK_COUNT;
   const historyWord = normalizeText_(CONFIG.HISTORY_KEYWORD);
 
@@ -121,7 +125,7 @@ function handleQuery_(event, parsed, sourceId, wantsHistory) {
     replyToLine_(event.replyToken, [{
       type: 'text',
       text: '要查哪個商品呢？請加上商品名稱，例如：「豬梅花 ' + CONFIG.HISTORY_KEYWORD + '」',
-    }]);
+    }], pushTarget);
     return;
   }
 
@@ -140,11 +144,11 @@ function handleQuery_(event, parsed, sourceId, wantsHistory) {
     blocks.push('⚠️ 一次最多查 ' + CONFIG.MAX_QUERY_ITEMS + ' 項，其餘 ' + (usable.length - items.length) + ' 項請分開問。');
   }
 
-  replyToLine_(event.replyToken, buildTextMessages_(blocks));
+  replyToLine_(event.replyToken, buildTextMessages_(blocks), pushTarget);
 }
 
 /** 記錄：寫入試算表，並附帶近期價格 */
-function handleRecord_(event, parsed, text, sourceId, today, vocab) {
+function handleRecord_(event, parsed, text, sourceId, today, vocab, pushTarget) {
   const messageDate = (parsed.date && parsed.date.trim()) ? parsed.date.trim() : today;
   const sharedLocation = (parsed.location && parsed.location.trim()) ? parsed.location.trim() : '';
   const replyBlocks = [];
@@ -193,7 +197,7 @@ function handleRecord_(event, parsed, text, sourceId, today, vocab) {
     replyBlocks.push(formatReplyBlock_(item, canonical, norm, location, history, result.overwritten));
   });
 
-  replyToLine_(event.replyToken, buildTextMessages_(replyBlocks));
+  replyToLine_(event.replyToken, buildTextMessages_(replyBlocks), pushTarget);
 }
 
 function formatQueryReplyBlock_(label, result, wantsHistory, limit, hasArchive) {

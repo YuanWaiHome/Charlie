@@ -116,6 +116,7 @@ LINE Webhook ──→ Cloudflare Worker（轉接層，驗證官方簽章、自�
   ```
   @機器人 豬梅花一斤205、活草蝦一斤750 竹圍漁港
   ```
+  語序也可以顛倒，例如「`200元一斤豬梅花`」或「`一斤豬梅花 200`」，會記成同一種結構。
 - 應該會收到類似：
   ```
   ✅ 豬梅花　每斤 $205（竹圍漁港）
@@ -173,6 +174,9 @@ LINE Webhook ──→ Cloudflare Worker（轉接層，驗證官方簽章、自�
 ## 已知限制 / 未來可以升級的方向
 
 - **Webhook 安全性**：已經用 Cloudflare Worker 讀取 `X-Line-Signature` header，做官方建議的 HMAC-SHA256 簽章驗證，確認請求真的是 LINE 平台送來的，不是用猜測亂數 token 的簡易做法。Worker 轉發給 Apps Script 時仍額外帶一組 `WEBHOOK_TOKEN` 當第二層防護（就算有人挖到 Apps Script 的網址，沒有這組 token 也打不通）。
+- **回覆逾時備援**：LINE 的 reply token 大約只有 30 秒有效。Worker 會先立刻回 200 再轉發 Apps Script；若解析／寫入較慢導致 reply 失敗，程式會改用 Push API 把同一則結果補送回「同一個對話」（群組就推回群組），避免「做完了但訊息石沉大海」。
+- **Gemini 失敗可讀**：呼叫失敗時會標出階段（連線／API Key／配額／模型／內容過濾／解析結果等）。若訊息看起來像純查詢，會改用文字直接搜尋，並在回覆裡附上失敗原因。
+- **語序自由**：記錄時「豬梅花一斤200」與「200元一斤豬梅花」視為同一筆；順序不影響解析。
 - **查詢範圍**：目前查詢是以「同一個 LINE 來源（同一個群組/同一個人）」為範圍查詢。如果你同時在多個群組使用這個機器人，各群組的記錄會分開，不會互通。
 - **Google Sheets 當資料庫**：資料量在幾千筆以內完全沒問題，家庭用途預期可以用非常久；真的量很大以後要換成正式資料庫，再重寫 `SheetStore.js` 這一層即可，其他程式不用動。
 - **模型名稱**：`Config.js` 裡的 `GEMINI_MODEL` 若未來該型號被停用，到 [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models) 查目前可用的模型名稱替換即可。

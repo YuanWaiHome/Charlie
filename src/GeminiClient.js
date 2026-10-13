@@ -77,6 +77,7 @@ function buildGeminiPrompt_(rawText, vocab, todayStr) {
     '訊息中若出現「' + CONFIG.HISTORY_KEYWORD + '」兩個字，且訊息是在查詢（沒有報新價格），那是「要求查全部歷史資料」的指令詞，不是商品名稱的一部分，請不要把它放進 product_raw / product_canonical / search_keywords；若訊息有報價格（record），則把它當一般文字處理（例如商品就叫「歷史課本」）。',
     '',
     '一則訊息可能同時描述多項商品（常用頓號、空白、逗號分隔），請拆成 items 陣列中的多筆，不要合併成一筆。',
+    '語序可以很自由：商品、數量、單位、價格、地點的出現順序不影響語意。例如「豬梅花一斤200」「200元一斤豬梅花」「一斤豬梅花 200」「豬梅花 200/斤」都是同一筆 record（product≈豬梅花、quantity=1、unit_raw=斤、price=200）。請依語意填欄位，不要因為順序不同就拆成不同商品或判成 unknown。',
     '地點通常出現在句尾，而且常常是講完所有商品之後才提一次，但其實適用於前面所有商品——除非語意上明顯只屬於某一項，才個別填在該項的 item_location。地點可能是市場、店家、賣場，也可能是網購平台（蝦皮、momo 等）。',
     '單位只需要抓出「原始用字本身」放到 unit_raw（例如 斤/台斤/公斤/兩/隻/尾/顆/把/包/盒/罐/片/件/瓶/組/雙/公升/毫升），不用自己換算數字，換算會由程式處理。查詢意圖若沒提到單位，unit_raw 留空、price 填 0、quantity 填 0。',
     '關於「台」：在買菜、買肉、買海鮮這類生鮮情境，「台」幾乎都是「台斤」的口語簡稱，unit_raw 照填「台」即可（程式會依類別處理）；但如果是電視、冷氣、手機等「一台機器」的意思，unit_raw 也填「台」，並把 category 填為「3C家電」。',
@@ -118,28 +119,79 @@ function parseMessageWithGemini_(rawText, vocab, todayStr) {
     },
   };
 
-  const res = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-  });
-
-  const code = res.getResponseCode();
-  if (code !== 200) {
-    throw new Error('Gemini API 呼叫失敗 (' + code + ')：' + res.getContentText());
+  let res;
+  try {
+    res = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+  } catch (err) {
+    throw new Error('【連線】無法連到 Gemini API：' + err);
   }
 
-  const json = JSON.parse(res.getContentText());
+  const code = res.getResponseCode();
+  const rawBody = res.getContentText();
+  if (code !== 200) {
+    throw new Error(describeGeminiHttpError_(code, rawBody));
+  }
+
+  let json;
+  try {
+    json = JSON.parse(rawBody);
+  } catch (err) {
+    throw new Error('【解析回應】Gemini 回傳不是合法 JSON（HTTP 200）：' + truncateForLog_(rawBody, 200));
+  }
+
   const candidate = json.candidates && json.candidates[0];
-  const text = candidate && candidate.content && candidate.content.parts &&
+  if (!candidate) {
+    const block = json.promptFeedback && json.promptFeedback.blockReason;
+    if (block) {
+      throw new Error('【內容過濾】請求被擋下（' + block + '）');
+    }
+    throw new Error('【空回應】沒有 candidates：' + truncateForLog_(rawBody, 200));
+  }
+
+  const finish = candidate.finishReason;
+  const text = candidate.content && candidate.content.parts &&
     candidate.content.parts[0] && candidate.content.parts[0].text;
 
   if (!text) {
-    throw new Error('Gemini 回傳格式異常：' + res.getContentText());
+    throw new Error('【空內容】有 candidate 但沒有文字' +
+      (finish ? '（finishReason=' + finish + '）' : '') + '：' + truncateForLog_(rawBody, 200));
   }
 
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error('【解析結果】模型回傳的 JSON 無法解析：' + truncateForLog_(text, 200));
+  }
+}
+
+/** 把 Gemini HTTP 錯誤轉成可讀的階段說明（給使用者／Log） */
+function describeGeminiHttpError_(code, rawBody) {
+  let detail = '';
+  try {
+    const j = JSON.parse(rawBody);
+    detail = (j.error && (j.error.message || j.error.status)) || '';
+  } catch (err) {
+    detail = truncateForLog_(rawBody, 160);
+  }
+  detail = detail ? '：' + detail : '';
+
+  if (code === 400) return '【請求格式】Gemini 拒絕請求 (HTTP 400)' + detail;
+  if (code === 401 || code === 403) return '【API Key】金鑰無效或沒權限 (HTTP ' + code + ')' + detail;
+  if (code === 404) return '【模型】找不到指定模型，請檢查 CONFIG.GEMINI_MODEL (HTTP 404)' + detail;
+  if (code === 429) return '【配額】呼叫太頻繁或今日額度用完 (HTTP 429)' + detail;
+  if (code >= 500) return '【伺服器】Gemini 端暫時異常 (HTTP ' + code + ')' + detail;
+  return '【API 呼叫】失敗 (HTTP ' + code + ')' + detail;
+}
+
+function truncateForLog_(text, maxLen) {
+  const s = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  if (s.length <= maxLen) return s;
+  return s.substring(0, maxLen) + '…';
 }
 
 /**
@@ -175,4 +227,14 @@ function testQueryHistory() {
   const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
   const result = parseMessageWithGemini_('梅花肉 歷史', getKnownVocabulary_(), today);
   Logger.log(JSON.stringify(result, null, 2));
+}
+
+/** 測試語序顛倒：應與「豬梅花一斤200」解析成同一結構 */
+function testParseWordOrder() {
+  const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  const vocab = getKnownVocabulary_();
+  const a = parseMessageWithGemini_('豬梅花一斤200', vocab, today);
+  const b = parseMessageWithGemini_('200元一斤豬梅花', vocab, today);
+  Logger.log('順序A：' + JSON.stringify(a, null, 2));
+  Logger.log('順序B：' + JSON.stringify(b, null, 2));
 }
